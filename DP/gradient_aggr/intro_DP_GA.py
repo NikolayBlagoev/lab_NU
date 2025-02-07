@@ -1,7 +1,8 @@
 from simplellm.llama import CausalLLama, LLama # get our models
 from simplellm.tokenizers import SPTokenizer # get our tokenizer
 from simplellm.dataloaders import TinyStories # get our dataset
-from torch.optim import SGD
+from simplellm.losses import causalLLMLoss # our loss
+from torch.optim import SGD, Adam
 import torch.nn.functional as F
 import torch
 import torch.distributed as dist
@@ -24,13 +25,12 @@ device = "cuda"
 tokenizer = SPTokenizer()
 # make the model
 net = LLama(CausalLLama,tokenizer.vocab_size,dmodel=dmodel,num_heads=num_heads,
-                device=device, n_layers=n_layers, ctx_size=seq_l)
-ds = TinyStories(tokenizer,batch_size=batch_size, seq_l=seq_l)
+                device=device, n_layers=n_layers, ctx_size=seq_l,padding_idx=tokenizer.pad_id)
+ds = TinyStories(tokenizer,batch_size=batch_size, seq_l=seq_l,skip=rank*3000) # skip so we can have different things
 # we can iterate the dataset with:
 iter_ds = iter(ds)
-for _ in range(rank): # offset dataset
-    next(iter_ds)
-optim = SGD(net.parameters(),lr=4e-3,momentum=0, dampening=0,weight_decay=0,nesterov=False)
+
+optim = Adam(net.parameters(),lr=8e-4)
 
 sizes = []
 len_sizes = []
@@ -38,25 +38,24 @@ for param in net.parameters():
     sizes.append(param.shape)
     len_sizes.append(len(param.view(-1)))
 
-for _ in range(10_000):
+for itr in range(5_000):
     optim.zero_grad()
-    x,y = next(iter_ds)
+    x = next(iter_ds)
+    target = x.clone().detach()
     x = x.to(device)
+    
     x = net(x)
-    B, T, C = x.shape
-    x = x.view(B*T,C)
-    y = y.view(B*T).to(device)
-    #compute loss:
-    loss = F.cross_entropy(x,y)
+    loss = causalLLMLoss(x,target,tokenizer.vocab_size)
     # log the loss:
-    print(loss.item())
+    print(itr,loss.item())
     loss.backward()
     
     dist.barrier() # wait for everyone
+    
     tmp = []
     for param in net.parameters():
         if param.grad == None:
-            tmp.append(torch.zeros_like(param).view(-1))                      
+            tmp.append(torch.zeros_like(param,device="cpu").view(-1))                      
             continue
         tmp.append(param.grad.view(-1))
         param.grad = None
@@ -66,6 +65,7 @@ for _ in range(10_000):
     for i, param in enumerate(net.parameters()):
         param.grad = tmp[i].view(sizes[i]).to(device)/world_size # average
     optim.step()
+    torch.cuda.empty_cache()
 
 
 
